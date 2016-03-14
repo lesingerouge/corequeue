@@ -1,5 +1,6 @@
 import uuid
 import time
+import random
 import redis
 
 
@@ -13,13 +14,13 @@ class Job(object):
         self._result = None
 
     def complete(self):
-        self.q.remove(self, completed=True)
+        self.q.remove(self.id, completed=True)
 
     def error(self):
         if self.attempts < self.q.max_attempts:
-            self.q.reschedule(self)
+            self.q.reschedule(self.id)
         else:
-            self.q.remove(self, error=True)
+            self.q.remove(self.id, error=True)
 
     def defer(self):
         self.q.reschedule(self, keep_attempts=True)
@@ -27,13 +28,13 @@ class Job(object):
     @property
     def result(self):
         if not self._result:
-            self._result = eval(self.q.get_result(self))
+            self._result = json.loads(self.q.get_result(self.id))
 
         return self._result
 
     @result.setter
     def result(self, data):
-        self.q.put_result(self, data)
+        self.q.put_result(self.id, json.dumps(data))
         self._result = data
 
     def __repr__(self):
@@ -49,7 +50,7 @@ class Job(object):
 
 class CoreQueue(object):
 
-    def __init__(self, name=None, host="localhost", port=6379, with_results=False, with_ack=False, keep_dead=False, max_attempts=5, job_timeout=3600):
+    def __init__(self, name=None, host="localhost", port=6379, with_results=False, with_ack=False, with_priority=False, keep_dead=False, max_attempts=5, job_timeout=3600):
         self.max_attempts = max_attempts
         self.timeout = job_timeout
 
@@ -74,21 +75,40 @@ class CoreQueue(object):
             self.ack_suffix = ":ACK"
         else:
             self.ack_suffix = None
+        if with_priority:
+            self.high = self.name + ":HIGH"
+        else:
+            self.high = None
 
-    def put(self, data):
-        objkey = self.name + ":" + str(uuid.uuid4())
+    def put(self, data, high_priority=False):
+        if not high_priority:
+            objkey = self.name + ":" + str(uuid.uuid4())
+            q = self.name
+        else:
+            objkey = self.high + ":" + str(uuid.uuid4())
+            q = self.high
 
         r = self.backend.pipeline()
         r.set(objkey, data)
-        r.lpush(self.name, objkey)
+        r.lpush(q, objkey)
         r.execute()
 
-    def next(self):
+        return Job(objkey, data, 0, self)
+
+    def next(self, ignore_high=False):
         self.clean_jobs()
-        objkey = self.backend.rpop(self.name)
+        if not ignore_high:
+            if self.backend.llen(self.high) > 0:
+                q = self.high
+            else:
+                q = self.name
+        else:
+            q = random.choice((self.name, self.high))
+
+        objkey = self.backend.rpop(q)
 
         if self.backend.hexists(self.locked, objkey):
-            self.backend.rpush(self.name, objkey)
+            self.backend.rpush(q, objkey)
             raise ValueError("Problem with locking")
         else:
             self.backend.hset(self.locked, objkey, time.time())
@@ -100,47 +120,50 @@ class CoreQueue(object):
 
         return Job(objkey, self.backend.get(objkey), self.backend.hget(self.attempts, objkey), self)
 
-    def remove(self, job, error=False, completed=False):
+    def remove(self, jobid, error=False, completed=False):
         r = self.backend.pipeline()
 
         if error and self.dead_msg_queue:
-            r.hset(self.dead_msg_queue, job.id, job.data)
+            r.hset(self.dead_msg_queue, jobid, job.data)
         if completed and self.ack_suffix:
-            r.hset(job.id + self.ack_suffix, "when", time.time())
-            r.expire(job.id + self.ack_suffix, 3600)
+            r.hset(jobid + self.ack_suffix, "when", time.time())
+            r.expire(jobid + self.ack_suffix, 3600)
 
-        r.hdel(self.locked, job.id)
-        r.hdel(self.attempts, job.id)
-        r.delete(job.id)
+        r.hdel(self.locked, jobid)
+        r.hdel(self.attempts, jobid)
+        r.delete(jobid)
         r.execute()
 
-    def reschedule(self, job, keep_attempts=False):
+    def reschedule(self, jobid, keep_attempts=False):
         r = self.backend.pipeline()
 
         if not keep_attempts:
-            r.hincrby(self.attempts, job.id, 1)
+            r.hincrby(self.attempts, jobid, 1)
 
-        r.hdel(self.locked, job.id)
-        r.lpush(self.name, job.id)
+        r.hdel(self.locked, jobid)
+        if self.high in jobid:
+            r.lpush(self.high, jobid)
+        else:
+            r.lpush(self.name, jobid)
         r.execute()
 
-    def put_result(self, job, data):
+    def put_result(self, jobid, data):
         if not self.result_suffix:
             raise NotImplementedError("Cannot store results in this queue.")
 
         if not data:
             raise ValueError("Cannot save empty result.")
 
-        result = bool(self.backend.hsetnx(job.id + self.result_suffix, "data", data))
+        result = bool(self.backend.hsetnx(jobid + self.result_suffix, "data", data))
         if not result:
             raise ValueError("Result exists already. Cannot be overwritten.")
-        self.backend.expire(job.id + self.result_suffix, 3600*24)
+        self.backend.expire(jobid + self.result_suffix, 3600*24)
 
-    def get_result(self, job):
+    def get_result(self, jobid):
         if not self.result_suffix:
             raise NotImplementedError("No stored results in this queue.")
 
-        return self.backend.get(job.id + self.result_suffix)
+        return self.backend.get(jobid + self.result_suffix)
 
     def reset(self):
         items_to_delete = []
@@ -151,6 +174,8 @@ class CoreQueue(object):
         r.delete(self.attempts)
         r.delete(self.locked)
         r.delete(self.name)
+        if self.high:
+            r.delete(self.high)
         r.delete(items_to_delete)
         r.execute()
 
@@ -165,4 +190,14 @@ class CoreQueue(object):
             if eval(locks[item]) + self.timeout < time.time():
                 self.backend.hdel(self.locked, item)
                 if self.backend.exists(item):
-                    self.backend.lpush(self.name, item)
+                    if self.high in item:
+                        self.backend.lpush(self.high, item)
+                    else:
+                        self.backend.lpush(self.name, item)
+
+    def size(self):
+        self.clean_jobs()
+        if not self.high:
+            return self.backend.llen(self.name)
+        else:
+            return self.backend.llen(self.name) + self.backend.llen(self.high)
